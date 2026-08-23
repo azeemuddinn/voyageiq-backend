@@ -5,6 +5,9 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from database import supabase
 from google import genai
+from fastapi import UploadFile, File, Form
+from pypdf import PdfReader
+import io
 
 load_dotenv()
 
@@ -41,22 +44,20 @@ def ingest_document(doc: DocumentIngest):
         doc_id = res.data[0]["id"]
         
         # 2. Chunk text by paragraphs
-        # 3. Chunk text by paragraphs
         chunks = [c.strip() for c in doc.content.split("\n\n") if c.strip()]
         
         if not chunks:
             return {"status": "success", "chunks_saved": 0}
 
-        # 3. Generate real vector embeddings using Gemini
-        # We use gemini-embedding-2 and request 768 dimensions
-        response = client.models.embed_content(
-            model="gemini-embedding-2",
-            contents=chunks,
-        )
-        
-        # 4. Save each chunk along with its vector array into Supabase
-        for i, chunk in enumerate(chunks):
-            vector_values = response.embeddings[i].values
+        # 3. Generate vectors safely item-by-item to prevent list index mismatches
+        for chunk in chunks:
+            response = client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=chunk,
+            )
+            
+            # Extract the vector values cleanly
+            vector_values = response.embeddings[0].values
             
             supabase.table("document_chunks").insert({
                 "document_id": doc_id,
@@ -68,7 +69,7 @@ def ingest_document(doc: DocumentIngest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 class ChatRequest(BaseModel):
     question: str
 
@@ -85,8 +86,8 @@ def chat_with_docs(req: ChatRequest):
         # 2. Query Supabase for relevant chunks using the function we just created
         match_res = supabase.rpc("match_document_chunks", {
             "query_embedding": q_vector,
-            "match_threshold": 0.3, # Adjust confidence threshold as needed
-            "match_count": 4        # Bring top 4 matching chunks
+            "match_threshold": 0.1, # Lowered threshold for test matching
+            "match_count": 4        
         }).execute()
 
         chunks = match_res.data
@@ -116,5 +117,55 @@ Answer:"""
             "sources_used": len(chunks)
         }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ingest-pdf")
+async def ingest_pdf(title: str = Form(...), file: UploadFile = File(...)):
+    try:
+        # 1. Read PDF bytes
+        contents = await file.read()
+        pdf_file = io.BytesIO(contents)
+        reader = PdfReader(pdf_file)
+        
+        # 2. Extract text from all pages
+        extracted_text = ""
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                extracted_text += text + "\n\n"
+                
+        if not extracted_text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF.")
+
+        # 3. Insert parent document record
+        res = supabase.table("documents").insert({
+            "title": title,
+            "source_type": "pdf"
+        }).execute()
+        
+        if not res.data:
+            raise HTTPException(status_code=400, detail="Failed to create document record.")
+            
+        doc_id = res.data[0]["id"]
+        
+        # 4. Chunk text and embed
+        chunks = [c.strip() for c in extracted_text.split("\n\n") if c.strip()]
+        
+        for chunk in chunks:
+            response = client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=chunk,
+            )
+            vector_values = response.embeddings[0].values
+            
+            supabase.table("document_chunks").insert({
+                "document_id": doc_id,
+                "content": chunk,
+                "embedding": vector_values
+            }).execute()
+            
+        return {"status": "success", "document_id": doc_id, "chunks_saved": len(chunks)}
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
