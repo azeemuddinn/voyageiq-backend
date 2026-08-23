@@ -71,34 +71,41 @@ def ingest_document(doc: DocumentIngest):
         raise HTTPException(status_code=500, detail=str(e))
     
 class ChatRequest(BaseModel):
-    question: str
+    question: str   
+    document_id: str | None = None
 
 @app.post("/chat")
 def chat_with_docs(req: ChatRequest):
     try:
         # 1. Embed the user's question
         q_response = client.models.embed_content(
-            model="gemini-embedding-2",
+            model="gemini-embedding-001",
             contents=req.question,
         )
         q_vector = q_response.embeddings[0].values
 
-        # 2. Query Supabase for relevant chunks using the function we just created
+        # 2. Query Supabase
         match_res = supabase.rpc("match_document_chunks", {
             "query_embedding": q_vector,
-            "match_threshold": 0.1, # Lowered threshold for test matching
+            "match_threshold": 0.0, 
             "match_count": 4        
         }).execute()
 
         chunks = match_res.data
         
-        if not chunks:
-            return {"answer": "I couldn't find any relevant information in your uploaded documents to answer this."}
+        # DEBUG: Print what chunks were retrieved in your FastAPI terminal
+        print("--- DEBUG CHUNKS RETRIEVED ---")
+        print(chunks)
+        print("------------------------------")
 
-        # 3. Build context from retrieved chunks
+        if req.document_id and chunks:
+            chunks = [c for c in chunks if c["document_id"] == req.document_id]
+
+        if not chunks:
+            return {"answer": "I couldn't find any relevant information in your uploaded documents to answer this.", "sources_used": 0}
+
         context_text = "\n\n---\n\n".join([c["content"] for c in chunks])
 
-        # 4. Generate the final answer using Gemini Flash or Pro
         prompt = f"""You are VoyageIQ, a helpful AI travel assistant. Answer the user's question using ONLY the context provided below. If the answer cannot be found in the context, say "I cannot find that in your uploaded documents."
 
 Context:
@@ -108,7 +115,7 @@ User Question: {req.question}
 Answer:"""
 
         ai_response = client.models.generate_content(
-            model="gemini-2.5-flash", # Or gemini-1.5-flash
+            model="gemini-2.5-flash",
             contents=prompt
         )
 
@@ -118,8 +125,9 @@ Answer:"""
         }
 
     except Exception as e:
+        print("ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-
+     
 @app.post("/ingest-pdf")
 async def ingest_pdf(title: str = Form(...), file: UploadFile = File(...)):
     try:
