@@ -177,3 +177,11 @@ async def ingest_pdf(title: str = Form(...), file: UploadFile = File(...)):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/documents")
+def get_documents():
+    try:
+        res = supabase.table("documents").select("id, title, created_at").order("created_at", desc=True).execute()
+        return {"documents": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))        
