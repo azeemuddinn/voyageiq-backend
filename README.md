@@ -22,5 +22,9 @@ source venv/bin/activate        # On Windows: venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
+# Configure environment variables
+cp .env.example .env
+# (Now fill in your GEMINI_API_KEY and Supabase credentials in the new .env file)
+
 # Start the API server locally
 uvicorn main:app --reload
