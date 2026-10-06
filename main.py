@@ -39,7 +39,7 @@ def ingest_document(doc: DocumentIngest):
         }).execute()
         
         if not res.data:
-            raise HTTPException(status_code=400, detail="Failed to create document record.")
+            raise HTTPException(status_code=400, detail="Failed to create document rec   ord.")
             
         doc_id = res.data[0]["id"]
         
