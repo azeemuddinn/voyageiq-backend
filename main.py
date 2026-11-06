@@ -8,6 +8,7 @@ from google import genai
 from fastapi import UploadFile, File, Form
 from pypdf import PdfReader
 import io
+from sentence_transformers import CrossEncoder
 
 load_dotenv()
 
@@ -74,37 +75,54 @@ class ChatRequest(BaseModel):
     question: str   
     document_id: str | None = None
 
+reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 @app.post("/chat")
 def chat_with_docs(req: ChatRequest):
     try:
-        # 1. Embed the user's question
+        # 1. Embed the user's question for vector search
         q_response = client.models.embed_content(
             model="gemini-embedding-001",
             contents=req.question,
         )
         q_vector = q_response.embeddings[0].values
 
-        # 2. Query Supabase
-        match_res = supabase.rpc("match_document_chunks", {
+        # 2. Project 3: Hybrid Search RPC (combines vector similarity + keyword search)
+        # We fetch a larger candidate pool (e.g., 20) for the re-ranker to filter
+        match_res = supabase.rpc("hybrid_search_document_chunks", {
+            "query_text": req.question,
             "query_embedding": q_vector,
-            "match_threshold": 0.0, 
-            "match_count": 4        
+            "match_count": 20        
         }).execute()
 
         chunks = match_res.data
         
-        # DEBUG: Print what chunks were retrieved in your FastAPI terminal
-        print("--- DEBUG CHUNKS RETRIEVED ---")
-        print(chunks)
-        print("------------------------------")
-
         if req.document_id and chunks:
             chunks = [c for c in chunks if c["document_id"] == req.document_id]
 
         if not chunks:
             return {"answer": "I couldn't find any relevant information in your uploaded documents to answer this.", "sources_used": 0}
 
-        context_text = "\n\n---\n\n".join([c["content"] for c in chunks])
+        # 3. Project 5: Cross-Encoder Re-ranking
+        # Pair the user question with each retrieved chunk text for deep semantic scoring
+        pairs = [[req.question, chunk["content"]] for chunk in chunks]
+        scores = reranker_model.predict(pairs)
+
+        # Attach the cross-encoder score to each chunk and sort descending
+        for i, chunk in enumerate(chunks):
+            chunk["relevance_score"] = float(scores[i])
+
+        chunks.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+        # Keep only the top 4 highest-scoring re-ranked chunks
+        top_chunks = chunks[:4]
+
+        # DEBUG: Inspect top re-ranked chunks
+        print("--- TOP RE-RANKED CHUNKS ---")
+        for c in top_chunks:
+            print(f"Score: {c['relevance_score']:.4f} | Content: {c['content'][:100]}...")
+        print("----------------------------")
+
+        context_text = "\n\n---\n\n".join([c["content"] for c in top_chunks])
 
         prompt = f"""You are VoyageIQ, a helpful AI travel assistant. Answer the user's question using ONLY the context provided below. If the answer cannot be found in the context, say "I cannot find that in your uploaded documents."
 
@@ -121,13 +139,16 @@ Answer:"""
 
         return {
             "answer": ai_response.text,
-            "sources_used": len(chunks)
+            "sources_used": len(top_chunks)
         }
 
     except Exception as e:
         print("ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-     
+
+
+
+
 @app.post("/ingest-pdf")
 async def ingest_pdf(title: str = Form(...), file: UploadFile = File(...)):
     try:
