@@ -147,64 +147,60 @@ class ChatRequest(BaseModel):
 #         raise HTTPException(status_code=500, detail=str(e))
 
 
-app.post("/chat")
+@app.post("/chat")
 def chat_with_docs(req: ChatRequest):
     try:
-        # 1. Generate embedding for user query
-        embedding_response = client.models.embed_content(
-            model="text-embedding-004",
-            contents=req.question
+        # 1. Embed the user's question
+        q_response = client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=req.question,
         )
-        query_embedding = embedding_response.embeddings[0].values
+        q_vector = q_response.embeddings[0].values
 
-        # 2. Call Supabase Hybrid Search RPC (Project 3: Dense + Sparse RRF)
-        rpc_response = supabase.rpc(
-            "hybrid_search_document_chunks",
-            {
-                "query_text": req.question,
-                "query_embedding": query_embedding,
-                "match_count": req.match_count * 2  # Fetch a wider candidate pool
-            }
-        ).execute()
+        # 2. Query Supabase
+        match_res = supabase.rpc("match_document_chunks", {
+            "query_embedding": q_vector,
+            "match_threshold": 0.0, 
+            "match_count": 4        
+        }).execute()
 
-        chunks = rpc_response.data
+        chunks = match_res.data
+        
+        # DEBUG: Print what chunks were retrieved in your FastAPI terminal
+        print("--- DEBUG CHUNKS RETRIEVED ---")
+        print(chunks)
+        print("------------------------------")
+
+        if req.document_id and chunks:
+            chunks = [c for c in chunks if c["document_id"] == req.document_id]
+
         if not chunks:
-            return {"answer": "I couldn't find any relevant information in the documents."}
+            return {"answer": "I couldn't find any relevant information in your uploaded documents to answer this.", "sources_used": 0}
 
-        # =========================================================================
-        # [ADVANCED - Project 5] Local Cross-Encoder Re-ranking Pipeline
-        # To enable: uncomment lines below (Requires paid server with >512MB RAM)
-        # =========================================================================
-        # pairs = [[req.question, chunk["content"]] for chunk in chunks]
-        # scores = reranker_model.predict(pairs)
-        # for i, chunk in enumerate(chunks):
-        #     chunk["relevance_score"] = float(scores[i])
-        # chunks = sorted(chunks, key=lambda x: x["relevance_score"], reverse=True)
-        # selected_chunks = chunks[:req.match_count]
-        # =========================================================================
+        context_text = "\n\n---\n\n".join([c["content"] for c in chunks])
 
-        # Stable fallback: use top hybrid search results directly
-        selected_chunks = chunks[:req.match_count]
+        prompt = f"""You are VoyageIQ, a helpful AI travel assistant. Answer the user's question using ONLY the context provided below. If the answer cannot be found in the context, say "I cannot find that in your uploaded documents."
 
-        # 3. Format context for Gemini
-        context_text = "\n\n".join([chunk["content"] for chunk in selected_chunks])
-        prompt = f"Use the following context to answer the user's question accurately.\n\nContext:\n{context_text}\n\nQuestion: {req.question}"
+Context:
+{context_text}
 
-        # 4. Generate response via Gemini
-        response = client.models.generate_content(
+User Question: {req.question}
+Answer:"""
+
+        ai_response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt
         )
 
         return {
-            "answer": response.text,
-            "sources_used": len(selected_chunks)
+            "answer": ai_response.text,
+            "sources_used": len(chunks)
         }
 
     except Exception as e:
+        print("ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-
-
+ 
 @app.post("/ingest-pdf")
 async def ingest_pdf(title: str = Form(...), file: UploadFile = File(...)):
     try:
