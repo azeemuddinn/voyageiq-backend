@@ -75,78 +75,134 @@ class ChatRequest(BaseModel):
     question: str   
     document_id: str | None = None
 
-reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-@app.post("/chat")
+# reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+# @app.post("/chat")
+# def chat_with_docs(req: ChatRequest):
+#     try:
+#         # 1. Embed the user's question for vector search
+#         q_response = client.models.embed_content(
+#             model="gemini-embedding-001",
+#             contents=req.question,
+#         )
+#         q_vector = q_response.embeddings[0].values
+
+#         # 2. Project 3: Hybrid Search RPC (combines vector similarity + keyword search)
+#         # We fetch a larger candidate pool (e.g., 20) for the re-ranker to filter
+#         match_res = supabase.rpc("hybrid_search_document_chunks", {
+#             "query_text": req.question,
+#             "query_embedding": q_vector,
+#             "match_count": 20        
+#         }).execute()
+
+#         chunks = match_res.data
+        
+#         if req.document_id and chunks:
+#             chunks = [c for c in chunks if c["document_id"] == req.document_id]
+
+#         if not chunks:
+#             return {"answer": "I couldn't find any relevant information in your uploaded documents to answer this.", "sources_used": 0}
+
+#         # 3. Project 5: Cross-Encoder Re-ranking
+#         # Pair the user question with each retrieved chunk text for deep semantic scoring
+#         pairs = [[req.question, chunk["content"]] for chunk in chunks]
+#         scores = reranker_model.predict(pairs)
+
+#         # Attach the cross-encoder score to each chunk and sort descending
+#         for i, chunk in enumerate(chunks):
+#             chunk["relevance_score"] = float(scores[i])
+
+#         chunks.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+#         # Keep only the top 4 highest-scoring re-ranked chunks
+#         top_chunks = chunks[:4]
+
+#         # DEBUG: Inspect top re-ranked chunks
+#         print("--- TOP RE-RANKED CHUNKS ---")
+#         for c in top_chunks:
+#             print(f"Score: {c['relevance_score']:.4f} | Content: {c['content'][:100]}...")
+#         print("----------------------------")
+
+#         context_text = "\n\n---\n\n".join([c["content"] for c in top_chunks])
+
+#         prompt = f"""You are VoyageIQ, a helpful AI travel assistant. Answer the user's question using ONLY the context provided below. If the answer cannot be found in the context, say "I cannot find that in your uploaded documents."
+
+# Context:
+# {context_text}
+
+# User Question: {req.question}
+# Answer:"""
+
+#         ai_response = client.models.generate_content(
+#             model="gemini-2.5-flash",
+#             contents=prompt
+#         )
+
+#         return {
+#             "answer": ai_response.text,
+#             "sources_used": len(top_chunks)
+#         }
+
+#     except Exception as e:
+#         print("ERROR:", str(e))
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+app.post("/chat")
 def chat_with_docs(req: ChatRequest):
     try:
-        # 1. Embed the user's question for vector search
-        q_response = client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=req.question,
+        # 1. Generate embedding for user query
+        embedding_response = client.models.embed_content(
+            model="text-embedding-004",
+            contents=req.question
         )
-        q_vector = q_response.embeddings[0].values
+        query_embedding = embedding_response.embeddings[0].values
 
-        # 2. Project 3: Hybrid Search RPC (combines vector similarity + keyword search)
-        # We fetch a larger candidate pool (e.g., 20) for the re-ranker to filter
-        match_res = supabase.rpc("hybrid_search_document_chunks", {
-            "query_text": req.question,
-            "query_embedding": q_vector,
-            "match_count": 20        
-        }).execute()
+        # 2. Call Supabase Hybrid Search RPC (Project 3: Dense + Sparse RRF)
+        rpc_response = supabase.rpc(
+            "hybrid_search_document_chunks",
+            {
+                "query_text": req.question,
+                "query_embedding": query_embedding,
+                "match_count": req.match_count * 2  # Fetch a wider candidate pool
+            }
+        ).execute()
 
-        chunks = match_res.data
-        
-        if req.document_id and chunks:
-            chunks = [c for c in chunks if c["document_id"] == req.document_id]
-
+        chunks = rpc_response.data
         if not chunks:
-            return {"answer": "I couldn't find any relevant information in your uploaded documents to answer this.", "sources_used": 0}
+            return {"answer": "I couldn't find any relevant information in the documents."}
 
-        # 3. Project 5: Cross-Encoder Re-ranking
-        # Pair the user question with each retrieved chunk text for deep semantic scoring
-        pairs = [[req.question, chunk["content"]] for chunk in chunks]
-        scores = reranker_model.predict(pairs)
+        # =========================================================================
+        # [ADVANCED - Project 5] Local Cross-Encoder Re-ranking Pipeline
+        # To enable: uncomment lines below (Requires paid server with >512MB RAM)
+        # =========================================================================
+        # pairs = [[req.question, chunk["content"]] for chunk in chunks]
+        # scores = reranker_model.predict(pairs)
+        # for i, chunk in enumerate(chunks):
+        #     chunk["relevance_score"] = float(scores[i])
+        # chunks = sorted(chunks, key=lambda x: x["relevance_score"], reverse=True)
+        # selected_chunks = chunks[:req.match_count]
+        # =========================================================================
 
-        # Attach the cross-encoder score to each chunk and sort descending
-        for i, chunk in enumerate(chunks):
-            chunk["relevance_score"] = float(scores[i])
+        # Stable fallback: use top hybrid search results directly
+        selected_chunks = chunks[:req.match_count]
 
-        chunks.sort(key=lambda x: x["relevance_score"], reverse=True)
+        # 3. Format context for Gemini
+        context_text = "\n\n".join([chunk["content"] for chunk in selected_chunks])
+        prompt = f"Use the following context to answer the user's question accurately.\n\nContext:\n{context_text}\n\nQuestion: {req.question}"
 
-        # Keep only the top 4 highest-scoring re-ranked chunks
-        top_chunks = chunks[:4]
-
-        # DEBUG: Inspect top re-ranked chunks
-        print("--- TOP RE-RANKED CHUNKS ---")
-        for c in top_chunks:
-            print(f"Score: {c['relevance_score']:.4f} | Content: {c['content'][:100]}...")
-        print("----------------------------")
-
-        context_text = "\n\n---\n\n".join([c["content"] for c in top_chunks])
-
-        prompt = f"""You are VoyageIQ, a helpful AI travel assistant. Answer the user's question using ONLY the context provided below. If the answer cannot be found in the context, say "I cannot find that in your uploaded documents."
-
-Context:
-{context_text}
-
-User Question: {req.question}
-Answer:"""
-
-        ai_response = client.models.generate_content(
+        # 4. Generate response via Gemini
+        response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt
         )
 
         return {
-            "answer": ai_response.text,
-            "sources_used": len(top_chunks)
+            "answer": response.text,
+            "sources_used": len(selected_chunks)
         }
 
     except Exception as e:
-        print("ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-
-
 
 
 @app.post("/ingest-pdf")
