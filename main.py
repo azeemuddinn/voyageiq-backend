@@ -8,7 +8,7 @@ from google import genai
 from fastapi import UploadFile, File, Form
 from pypdf import PdfReader
 import io
-from sentence_transformers import CrossEncoder
+# from sentence_transformers import CrossEncoder
 
 load_dotenv()
 
